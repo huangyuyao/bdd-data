@@ -1,5 +1,6 @@
 .DS_Store
 .idea
+.vscode
 internal
 
 # Byte-compiled / optimized / DLL files

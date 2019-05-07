@@ -14,6 +14,11 @@ from PIL import Image
 import sys
 from collections import Iterable
 import io
+from pprint import pprint
+import itertools
+import math
+import traceback
+import copy
 
 from .label import labels
 
@@ -22,12 +27,13 @@ __copyright__ = 'Copyright (c) 2018, Fisher Yu'
 __email__ = 'i@yf.io'
 __license__ = 'BSD'
 
-
 def parse_args():
     """Use argparse to get command line arguments"""
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--image", required=False,
                         help="input raw image", type=str)
+    parser.add_argument('--start-id', type=int, default=0,
+                        help="start image index")
     parser.add_argument('--image-dir', help='image directory')
     parser.add_argument("-l", "--label", required=True,
                         help="corresponding bounding box annotation "
@@ -36,10 +42,14 @@ def parse_args():
                         help="Scale up factor for annotation factor. "
                              "Useful when producing visualization as "
                              "thumbnails.")
+    parser.add_argument('--no-image', action='store_true', default=False,
+                        help="Do not show image")
     parser.add_argument('--no-attr', action='store_true', default=False,
                         help="Do not show attributes")
     parser.add_argument('--no-lane', action='store_true', default=False,
                         help="Do not show lanes")
+    parser.add_argument('--no-stopline', action='store_true', default=False,
+                        help="Do not show stoplines")
     parser.add_argument('--no-drivable', action='store_true', default=False,
                         help="Do not show drivable areas")
     parser.add_argument('--no-box2d', action='store_true', default=False,
@@ -96,6 +106,86 @@ def get_lanes(objects):
     return [o for o in objects
             if 'poly2d' in o and o['category'][:4] == 'lane']
 
+class LLPoly(object):
+    def __init__(self, poly2d):
+        v = poly2d['vertices']
+        self.x1, self.y1, self.x2, self.y2 = \
+                v[0][0], v[0][1], v[-1][0], v[-1][1]
+        self.p1 = [self.x1, self.y1]
+        self.p2 = [self.x2, self.y2]
+        self.full_vertices = v
+        self.types = poly2d['types']
+    def get_angle(self):
+        return abs((self.y2-self.y1)/(self.x2-self.x1))
+    def is_relavant(self):
+        return (self.x2 > 600 or self.x1 > 600) and \
+                (self.y2 > 400 or self.y1 > 400) and \
+                self.get_angle() < 0.2
+    def min_dist(self, other):
+        dist = lambda a, b: math.sqrt((a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1]))
+        return min([ dist(self.p1, other.p1),
+            dist(self.p1, other.p2), dist(self.p2, other.p1), dist(self.p2, other.p2) ])
+    def combine(self, other):
+        dist = lambda a, b: math.sqrt((a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1]))
+        if dist(self.p1, other.p1) < dist(self.p1, other.p2):
+            other.full_vertices = other.full_vertices[::-1]
+            other.types = other.types[::-1]
+        return self.types + other.types, \
+                self.full_vertices + other.full_vertices
+    def copy(self):
+        return copy.copy(self)
+
+
+
+
+def get_stoplines(objects):
+
+    # filter
+    selected_lanes = []
+    selected_llpoly = []
+    for o in objects:
+        if not ('poly2d' in o and o['category'][:4] == 'lane' and \
+            o['attributes']['laneDirection'] == 'vertical' and \
+            o['attributes']['laneStyle'] == 'solid' and \
+            len(o['poly2d']) == 1):
+            continue
+        o = o.copy()
+        o['category'] = 'stopline'
+        p = o['poly2d'][0]
+        line = LLPoly(p)
+        p['angle'] = line.get_angle()
+        p['relavant'] = line.is_relavant()
+        selected_lanes += [o]
+        selected_llpoly += [line]
+
+    # combine
+    stoplines = []
+    indexes = list(range(len(selected_lanes)))
+    while len(indexes) > 1:
+        mi1, mi2 = -1, -1
+        min_dist = 35
+        for i1, i2 in itertools.combinations(indexes, 2):
+            l1, l2 = selected_llpoly[i1], selected_llpoly[i2]
+            cur_dist = l1.min_dist(l2)
+            if cur_dist < min_dist:
+                min_dist = cur_dist
+                mi1, mi2 = i1, i2
+        if mi1 < 0:
+            break
+        else:
+            l1, l2 = selected_llpoly[mi1], selected_llpoly[mi2]
+            o = selected_lanes[mi1]
+            o['poly2d'][0]['types'], o['poly2d'][0]['vertices'] = l1.combine(l2)
+            o['poly2d'][0]['closed'] = True
+            stoplines.append(o)
+            indexes.remove(mi1)
+            indexes.remove(mi2)
+
+    stoplines += selected_lanes
+
+    return stoplines
+
+
 
 def get_other_poly2d(objects):
     return [o for o in objects
@@ -108,6 +198,8 @@ def get_boxes(objects):
 
 
 def get_target_objects(objects, targets):
+    if 'stopline' in targets:
+        targets += ['lane']
     return [o for o in objects if o['category'] in targets]
 
 
@@ -184,297 +276,6 @@ def convert_drivable_rgb(label_path):
     #     join(label_dir, label_name + '_drivable_instance_color.png'))
 
 
-class LabelViewer(object):
-    def __init__(self, args):
-        """Visualize bounding boxes"""
-        self.ax = None
-        self.fig = None
-        self.current_index = 0
-        self.scale = args.scale
-        image_paths = [args.image]
-        label_paths = [args.label]
-        if isdir(args.label):
-            input_names = sorted(
-                [splitext(n)[0] for n in os.listdir(args.label)
-                 if splitext(n)[1] == '.json'])
-            image_paths = [join(args.image, n + '.jpg') for n in input_names]
-            label_paths = [join(args.label, n + '.json') for n in input_names]
-        self.image_paths = image_paths
-        self.label_paths = label_paths
-
-        self.font = FontProperties()
-        self.font.set_family(['Luxi Mono', 'monospace'])
-        self.font.set_weight('bold')
-        self.font.set_size(18 * self.scale)
-
-        self.with_image = True
-        self.with_attr = not args.no_attr
-        self.with_lane = not args.no_lane
-        self.with_drivable = not args.no_drivable
-        self.with_box2d = not args.no_box2d
-        self.with_segment = True
-
-        self.target_objects = args.target_objects
-
-        if len(self.target_objects) > 0:
-            print('Only showing objects:', self.target_objects)
-
-        self.out_dir = args.output_dir
-        self.label_map = dict([(l.name, l) for l in labels])
-        self.color_mode = 'random'
-
-        self.image_width = 1280
-        self.image_height = 720
-
-        self.instance_mode = False
-        self.drivable_mode = False
-        self.with_post = False  # with post processing
-
-        if args.drivable:
-            self.set_drivable_mode()
-
-        if args.instance:
-            self.set_instance_mode()
-
-    def view(self):
-        self.current_index = 0
-        if self.out_dir is None:
-            self.show()
-        else:
-            self.write()
-
-    def show(self):
-        # Read and draw image
-        dpi = 80
-        w = 16
-        h = 9
-        self.fig = plt.figure(figsize=(w, h), dpi=dpi)
-        self.ax = self.fig.add_axes([0.0, 0.0, 1.0, 1.0], frameon=False)
-        if len(self.image_paths) > 1:
-            plt.connect('key_release_event', self.next_image)
-        self.show_image()
-        plt.show()
-
-    def write(self):
-        dpi = 80
-        w = 16
-        h = 9
-        self.fig = plt.figure(figsize=(w, h), dpi=dpi)
-        self.ax = self.fig.add_axes([0.0, 0.0, 1.0, 1.0], frameon=False)
-
-        out_paths = []
-        for i in range(len(self.image_paths)):
-            self.current_index = i
-            out_name = splitext(split(self.image_paths[i])[1])[0] + '.png'
-            out_path = join(self.out_dir, out_name)
-            if self.show_image():
-                self.fig.savefig(out_path, dpi=dpi)
-                out_paths.append(out_path)
-        if self.with_post:
-            print('Post-processing')
-            p = Pool(10)
-            if self.instance_mode:
-                p.map(convert_instance_rgb, out_paths)
-            if self.drivable_mode:
-                p = Pool(10)
-                p.map(convert_drivable_rgb, out_paths)
-
-    def set_instance_mode(self):
-        self.with_image = False
-        self.with_attr = False
-        self.with_drivable = False
-        self.with_lane = False
-        self.with_box2d = False
-        self.with_segment = True
-        self.color_mode = 'instance'
-        self.instance_mode = True
-        self.with_post = True
-
-    def set_drivable_mode(self):
-        self.with_image = False
-        self.with_attr = False
-        self.with_drivable = True
-        self.with_lane = False
-        self.with_box2d = False
-        self.with_segment = False
-        self.color_mode = 'instance'
-        self.drivable_mode = True
-        self.with_post = True
-
-    def show_image(self):
-        plt.cla()
-        label_path = self.label_paths[self.current_index]
-        name = splitext(split(label_path)[1])[0]
-        print('Image:', name)
-        self.fig.canvas.set_window_title(name)
-
-        if self.with_image:
-            image_path = self.image_paths[self.current_index]
-            img = mpimg.imread(image_path)
-            im = np.array(img, dtype=np.uint8)
-            self.ax.imshow(im, interpolation='nearest', aspect='auto')
-        else:
-            self.ax.set_xlim(0, self.image_width - 1)
-            self.ax.set_ylim(0, self.image_height - 1)
-            self.ax.invert_yaxis()
-            self.ax.add_patch(self.poly2patch(
-                [[0, 0, 'L'], [0, self.image_height - 1, 'L'],
-                 [self.image_width - 1, self.image_height - 1, 'L'],
-                 [self.image_width - 1, 0, 'L']],
-                closed=True, alpha=1., color='black'))
-
-        # Read annotation labels
-        with open(label_path) as data_file:
-            label = json.load(data_file)
-        objects = label['frames'][0]['objects']
-
-        if len(self.target_objects) > 0:
-            objects = get_target_objects(objects, self.target_objects)
-            if len(objects) == 0:
-                return False
-
-        if 'attributes' in label and self.with_attr:
-            attributes = label['attributes']
-            self.ax.text(
-                25 * self.scale, 90 * self.scale,
-                '  scene: {}\nweather: {}\n   time: {}'.format(
-                    attributes['scene'], attributes['weather'],
-                    attributes['timeofday']),
-                fontproperties=self.font,
-                color='red',
-                bbox={'facecolor': 'white', 'alpha': 0.4, 'pad': 10, 'lw': 0})
-
-        if self.with_drivable:
-            self.draw_drivable(objects)
-        if self.with_lane:
-            self.draw_lanes(objects)
-        if self.with_box2d:
-            [self.ax.add_patch(self.box2rect(b['box2d']))
-             for b in get_boxes(objects)]
-        if self.with_segment:
-            self.draw_segments(objects)
-        self.ax.axis('off')
-        return True
-
-    def next_image(self, event):
-        if event.key == 'n':
-            self.current_index += 1
-        elif event.key == 'p':
-            self.current_index -= 1
-        else:
-            return
-        self.current_index = max(min(self.current_index,
-                                     len(self.image_paths) - 1), 0)
-        if self.show_image():
-            plt.draw()
-        else:
-            self.next_image(event)
-
-    def poly2patch(self, poly2d, closed=False, alpha=1., color=None):
-        moves = {'L': Path.LINETO,
-                 'C': Path.CURVE4}
-        points = [p[:2] for p in poly2d]
-        codes = [moves[p[2]] for p in poly2d]
-        codes[0] = Path.MOVETO
-
-        if closed:
-            points.append(points[0])
-            codes.append(Path.CLOSEPOLY)
-
-        if color is None:
-            color = random_color()
-
-        # print(codes, points)
-        return mpatches.PathPatch(
-            Path(points, codes),
-            facecolor=color if closed else 'none',
-            edgecolor=color,  # if not closed else 'none',
-            lw=1 if closed else 2 * self.scale, alpha=alpha,
-            antialiased=False, snap=True)
-
-    def draw_drivable(self, objects):
-        objects = get_areas_v0(objects)
-        colors = np.array([[0, 0, 0, 255],
-                           [217, 83, 79, 255],
-                           [91, 192, 222, 255]]) / 255
-        for obj in objects:
-            if self.color_mode == 'random':
-                if obj['category'] == 'area/drivable':
-                    color = colors[1]
-                else:
-                    color = colors[2]
-                alpha = 0.5
-            else:
-                color = (
-                    (1 if obj['category'] == 'area/drivable' else 2) / 255.,
-                    obj['id'] / 255., 0)
-                alpha = 1
-            self.ax.add_patch(self.poly2patch(
-                obj['poly2d'], closed=True, alpha=alpha, color=color))
-
-    def draw_lanes(self, objects):
-        objects = get_lanes(objects)
-        # colors = np.array([[0, 0, 0, 255],
-        #                    [217, 83, 79, 255],
-        #                    [91, 192, 222, 255]]) / 255
-        colors = np.array([[0, 0, 0, 255],
-                           [255, 0, 0, 255],
-                           [0, 0, 255, 255]]) / 255
-        for obj in objects:
-            if self.color_mode == 'random':
-                if obj['attributes']['direction'] == 'parallel':
-                    color = colors[1]
-                else:
-                    color = colors[2]
-                alpha = 0.9
-            else:
-                color = (
-                    (1 if obj['category'] == 'area/drivable' else 2) / 255.,
-                    obj['id'] / 255., 0)
-                alpha = 1
-            self.ax.add_patch(self.poly2patch(
-                obj['poly2d'], closed=False, alpha=alpha, color=color))
-
-    def draw_segments(self, objects):
-        color_mode = self.color_mode
-        for obj in objects:
-            if 'segments2d' not in obj:
-                continue
-            if color_mode == 'random':
-                color = random_color()
-                alpha = 0.5
-            elif color_mode == 'instance':
-                try:
-                    label = self.label_map[obj['category']]
-                    color = (label.trainId / 255., obj['id'] / 255., 0)
-                except KeyError:
-                    color = (1, 0, 0)
-                alpha = 1
-            else:
-                raise ValueError('Unknown color mode {}'.format(
-                    self.color_mode))
-            for segment in obj['segments2d']:
-                self.ax.add_patch(self.poly2patch(
-                    segment, closed=True, alpha=alpha, color=color))
-
-    def box2rect(self, box2d):
-        """generate individual bounding box from label"""
-        x1 = box2d['x1']
-        y1 = box2d['y1']
-        x2 = box2d['x2']
-        y2 = box2d['y2']
-
-        # Pick random color for each box
-        box_color = random_color()
-
-        # Draw and add one box to the figure
-        return mpatches.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1,
-            linewidth=3 * self.scale, edgecolor=box_color, facecolor='none',
-            fill=False, alpha=0.75
-        )
-
-
 def read_labels(label_path):
     labels = json.load(open(label_path, 'r'))
     if not isinstance(labels, Iterable):
@@ -500,6 +301,8 @@ class LabelViewer2(object):
         else:
             label_paths = [args.label]
         self.label_paths = label_paths
+        if args.image_dir is None:
+            args.image_dir
         self.image_dir = args.image_dir
 
         self.font = FontProperties()
@@ -507,9 +310,10 @@ class LabelViewer2(object):
         self.font.set_weight('bold')
         self.font.set_size(18 * self.scale)
 
-        self.with_image = True
+        self.with_image = not args.no_image
         self.with_attr = not args.no_attr
         self.with_lane = not args.no_lane
+        self.with_stopline = not args.no_stopline
         self.with_drivable = not args.no_drivable
         self.with_box2d = not args.no_box2d
         self.poly2d = True
@@ -539,8 +343,8 @@ class LabelViewer2(object):
 
         self.label = read_labels(self.label_paths[self.file_index])
 
-    def view(self):
-        self.frame_index = 0
+    def view(self, start_from=0):
+        self.frame_index = start_from
         if self.out_dir is None:
             self.show()
         else:
@@ -600,6 +404,7 @@ class LabelViewer2(object):
         self.with_attr = False
         self.with_drivable = False
         self.with_lane = False
+        self.with_stopline = False
         self.with_box2d = False
         self.poly2d = True
         self.color_mode = 'instance'
@@ -611,6 +416,7 @@ class LabelViewer2(object):
         self.with_attr = False
         self.with_drivable = True
         self.with_lane = False
+        self.with_stopline = False
         self.with_box2d = False
         self.poly2d = False
         self.color_mode = 'instance'
@@ -631,8 +437,9 @@ class LabelViewer2(object):
             self.label = read_labels(self.label_paths[self.file_index])
 
         frame = self.label[self.frame_index - self.start_index]
+        self.current_frame = frame
 
-        print('Image:', frame['name'])
+        print('Image: No.', self.frame_index, "\t", frame['name'])
         self.fig.canvas.set_window_title(frame['name'])
 
         if self.with_image:
@@ -660,6 +467,7 @@ class LabelViewer2(object):
             return True
 
         objects = frame['labels']
+        self.current_objects = objects
 
         if len(self.target_objects) > 0:
             objects = get_target_objects(objects, self.target_objects)
@@ -668,11 +476,12 @@ class LabelViewer2(object):
 
         if self.with_attr:
             self.show_attributes(frame)
-
         if self.with_drivable:
             self.draw_drivable(objects)
         if self.with_lane:
             self.draw_lanes(objects)
+        if self.with_stopline:
+            self.draw_stoplines(objects)
         if self.with_box2d:
             [self.ax.add_patch(self.box2rect(b['id'], b['box2d']))
              for b in get_boxes(objects)]
@@ -686,6 +495,8 @@ class LabelViewer2(object):
             self.frame_index += 1
         elif event.key == 'p':
             self.frame_index -= 1
+        elif event.key == 'd':
+            import pdb; pdb.set_trace()
         else:
             return
         self.frame_index = max(self.frame_index, 0)
@@ -762,6 +573,23 @@ class LabelViewer2(object):
                     poly['vertices'], poly['types'], closed=poly['closed'],
                     alpha=alpha, color=color))
 
+    def draw_stoplines(self, objects):
+        try:
+            objects = get_stoplines(objects)
+        except Exception as e:
+            traceback.print_exc()
+            print("StopLine Parse Error:", e)
+            import pdb; pdb.set_trace()
+            objects = get_stoplines(objects)
+        for obj in objects:
+            color = (0.5, 0.5, 1.)
+            alpha = 1
+            #pprint(obj['poly2d'])
+            for poly in obj['poly2d']:
+                self.ax.add_patch(self.poly2patch(
+                    poly['vertices'], poly['types'], closed=poly['closed'],
+                    alpha=alpha, color=color))
+
     def draw_other_poly2d(self, objects):
         color_mode = self.color_mode
         objects = get_other_poly2d(objects)
@@ -832,11 +660,9 @@ class LabelViewer2(object):
 
 def main():
     args = parse_args()
-    if args.format == 'v1':
-        viewer = LabelViewer(args)
-    else:
-        viewer = LabelViewer2(args)
-    viewer.view()
+    assert args.format == 'v2', 'v1 format is deprecated'
+    viewer = LabelViewer2(args)
+    viewer.view(args.start_id)
 
 
 if __name__ == '__main__':
