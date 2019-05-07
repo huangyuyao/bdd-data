@@ -48,8 +48,8 @@ def parse_args():
                         help="Do not show attributes")
     parser.add_argument('--no-lane', action='store_true', default=False,
                         help="Do not show lanes")
-    parser.add_argument('--no-stopline', action='store_true', default=False,
-                        help="Do not show stoplines")
+    parser.add_argument('--no-seglane', action='store_true', default=False,
+                        help="Do not show lane_segmentation")
     parser.add_argument('--no-drivable', action='store_true', default=False,
                         help="Do not show drivable areas")
     parser.add_argument('--no-box2d', action='store_true', default=False,
@@ -117,7 +117,7 @@ class LLPoly(object):
         self.types = poly2d['types']
     def get_angle(self):
         return abs((self.y2-self.y1)/(self.x2-self.x1))
-    def is_relavant(self):
+    def is_relevant(self): # only for reference
         return (self.x2 > 600 or self.x1 > 600) and \
                 (self.y2 > 400 or self.y1 > 400) and \
                 self.get_angle() < 0.2
@@ -135,38 +135,49 @@ class LLPoly(object):
     def copy(self):
         return copy.copy(self)
 
+def get_seglanes(objects, draw_unrelevant):
+    stopline = dict(lanetype='stopline',
+            filter_func = lambda o: o['attributes']['laneDirection'] == 'vertical' and \
+                                    o['attributes']['laneStyle'] == 'solid',
+            dist_thres = 35,
+            dist_func = lambda l1, l2 : l1.min_dist(l2),
+            draw_unrelevant = draw_unrelevant
+            )
+    seglane_cfgs = [stopline]
+    seglanes = []
+    for seglane_cfg in seglane_cfgs:
+        seglanes += get_seglanes_by_filter(objects, **seglane_cfg)
+    return seglanes
 
-
-
-def get_stoplines(objects):
+def get_seglanes_by_filter(objects, lanetype, filter_func, dist_thres, dist_func, draw_unrelevant=True):
 
     # filter
     selected_lanes = []
     selected_llpoly = []
     for o in objects:
         if not ('poly2d' in o and o['category'][:4] == 'lane' and \
-            o['attributes']['laneDirection'] == 'vertical' and \
-            o['attributes']['laneStyle'] == 'solid' and \
-            len(o['poly2d']) == 1):
+                len(o['poly2d']) == 1 and filter_func(o)):
             continue
         o = o.copy()
-        o['category'] = 'stopline'
+        o['category'] = lanetype
         p = o['poly2d'][0]
         line = LLPoly(p)
-        p['angle'] = line.get_angle()
-        p['relavant'] = line.is_relavant()
+        if lanetype in ['stopline', 'crosswalk']:
+            p['relevant'] = line.is_relevant()
+            if not draw_unrelevant and not p['relevant']:
+                continue
         selected_lanes += [o]
         selected_llpoly += [line]
 
     # combine
-    stoplines = []
+    seglines = []
     indexes = list(range(len(selected_lanes)))
     while len(indexes) > 1:
         mi1, mi2 = -1, -1
-        min_dist = 35
+        min_dist = dist_thres
         for i1, i2 in itertools.combinations(indexes, 2):
             l1, l2 = selected_llpoly[i1], selected_llpoly[i2]
-            cur_dist = l1.min_dist(l2)
+            cur_dist = dist_func(l1, l2)
             if cur_dist < min_dist:
                 min_dist = cur_dist
                 mi1, mi2 = i1, i2
@@ -177,13 +188,13 @@ def get_stoplines(objects):
             o = selected_lanes[mi1]
             o['poly2d'][0]['types'], o['poly2d'][0]['vertices'] = l1.combine(l2)
             o['poly2d'][0]['closed'] = True
-            stoplines.append(o)
+            seglines.append(o)
             indexes.remove(mi1)
             indexes.remove(mi2)
 
-    stoplines += selected_lanes
+    seglines += selected_lanes
 
-    return stoplines
+    return seglines
 
 
 
@@ -313,9 +324,10 @@ class LabelViewer2(object):
         self.with_image = not args.no_image
         self.with_attr = not args.no_attr
         self.with_lane = not args.no_lane
-        self.with_stopline = not args.no_stopline
+        self.with_seglane = not args.no_seglane
         self.with_drivable = not args.no_drivable
         self.with_box2d = not args.no_box2d
+        self.draw_unrelevant = True
         self.poly2d = True
 
         self.target_objects = args.target_objects
@@ -480,8 +492,8 @@ class LabelViewer2(object):
             self.draw_drivable(objects)
         if self.with_lane:
             self.draw_lanes(objects)
-        if self.with_stopline:
-            self.draw_stoplines(objects)
+        if self.with_seglane:
+            self.draw_seglanes(objects)
         if self.with_box2d:
             [self.ax.add_patch(self.box2rect(b['id'], b['box2d']))
              for b in get_boxes(objects)]
@@ -573,22 +585,23 @@ class LabelViewer2(object):
                     poly['vertices'], poly['types'], closed=poly['closed'],
                     alpha=alpha, color=color))
 
-    def draw_stoplines(self, objects):
+    def draw_seglanes(self, objects):
         try:
-            objects = get_stoplines(objects)
+            objects = get_seglanes(objects, self.draw_unrelevant)
         except Exception as e:
             traceback.print_exc()
             print("StopLine Parse Error:", e)
             import pdb; pdb.set_trace()
-            objects = get_stoplines(objects)
+            objects = get_seglanes(objects, self.draw_unrelevant)
+        color = {
+                'stopline': (0.5, 0.5, 1.),
+                }
         for obj in objects:
-            color = (0.5, 0.5, 1.)
             alpha = 1
-            #pprint(obj['poly2d'])
             for poly in obj['poly2d']:
                 self.ax.add_patch(self.poly2patch(
                     poly['vertices'], poly['types'], closed=poly['closed'],
-                    alpha=alpha, color=color))
+                    alpha=alpha, color=color[obj['category']]))
 
     def draw_other_poly2d(self, objects):
         color_mode = self.color_mode
