@@ -125,31 +125,65 @@ class LLPoly(object):
         dist = lambda a, b: math.sqrt((a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1]))
         return min([ dist(self.p1, other.p1),
             dist(self.p1, other.p2), dist(self.p2, other.p1), dist(self.p2, other.p2) ])
+    def min_sum_dist(self, other):
+        dist = lambda a, b: math.sqrt((a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1]))
+        return min([ dist(self.p1, other.p1) + dist(self.p2, other.p2),
+            dist(self.p1, other.p2) + dist(self.p2, other.p1) ])
     def combine(self, other):
         dist = lambda a, b: math.sqrt((a[0]-b[0])*(a[0]-b[0])+(a[1]-b[1])*(a[1]-b[1]))
         if dist(self.p1, other.p1) < dist(self.p1, other.p2):
+            other = other.copy()
             other.full_vertices = other.full_vertices[::-1]
             other.types = other.types[::-1]
         return self.types + other.types, \
                 self.full_vertices + other.full_vertices
     def copy(self):
         return copy.copy(self)
+    def get_threshold_based_on_miny(self, other):
+        min_y = min([self.y1, self.y2, other.y1, other.y2])
+        thres = 0.1 * min_y - 0
+        return thres
+    def make_curb_region(self):
+        t = '{}{}'.format(self.types, self.types[::-1])
+        reverse_vertices = [[x,y-10] for x, y in self.full_vertices[::-1]]
+        v = self.full_vertices + reverse_vertices
+        return t, v
 
 def get_seglanes(objects, draw_unrelevant):
-    stopline = dict(lanetype='stopline',
+    stopline = dict(lanetype = lambda o : 'stopline',
             filter_func = lambda o: o['attributes']['laneDirection'] == 'vertical' and \
-                                    o['attributes']['laneStyle'] == 'solid',
-            dist_thres = 35,
-            dist_func = lambda l1, l2 : l1.min_dist(l2),
+                                    o['attributes']['laneStyle'] == 'solid' and \
+                                    o['attributes']['laneType'] == 'single white',
             draw_unrelevant = draw_unrelevant
             )
-    seglane_cfgs = [stopline]
+    lane = dict(lanetype = lambda o : '{} {}'.format(o['attributes']['laneType'], o['attributes']['laneStyle']),
+            filter_func = lambda o: o['attributes']['laneDirection'] == 'parallel' and \
+                                    o['attributes']['laneType'] not in ['road curb', 'crosswalk'],
+            )
+    seglane_cfgs = [stopline, lane]
     seglanes = []
     for seglane_cfg in seglane_cfgs:
         seglanes += get_seglanes_by_filter(objects, **seglane_cfg)
+    seglanes += get_curb(objects)
     return seglanes
 
-def get_seglanes_by_filter(objects, lanetype, filter_func, dist_thres, dist_func, draw_unrelevant=True):
+def get_curb(objects):
+    curbs = []
+    for o in objects:
+        if not ('poly2d' in o and o['category'][:4] == 'lane' and \
+                len(o['poly2d']) == 1 and o['attributes']['laneType'] == 'road curb'):
+            continue
+        p = o['poly2d'][0]
+        l = LLPoly(p)
+        o['category'] = 'road curb'
+        o['poly2d'][0]['types'], o['poly2d'][0]['vertices'] = l.make_curb_region()
+        o['poly2d'][0]['closed'] = True
+        curbs.append(o)
+    return curbs
+
+
+def get_seglanes_by_filter(objects, lanetype, filter_func,
+        threshold_func=lambda l1,l2:l1.get_threshold_based_on_miny(l2), draw_unrelevant=True):
 
     # filter
     selected_lanes = []
@@ -159,7 +193,7 @@ def get_seglanes_by_filter(objects, lanetype, filter_func, dist_thres, dist_func
                 len(o['poly2d']) == 1 and filter_func(o)):
             continue
         o = o.copy()
-        o['category'] = lanetype
+        o['category'] = lanetype(o)
         p = o['poly2d'][0]
         line = LLPoly(p)
         if lanetype in ['stopline', 'crosswalk']:
@@ -174,12 +208,14 @@ def get_seglanes_by_filter(objects, lanetype, filter_func, dist_thres, dist_func
     indexes = list(range(len(selected_lanes)))
     while len(indexes) > 1:
         mi1, mi2 = -1, -1
-        min_dist = dist_thres
+        min_sum_dist = 10000
         for i1, i2 in itertools.combinations(indexes, 2):
             l1, l2 = selected_llpoly[i1], selected_llpoly[i2]
-            cur_dist = dist_func(l1, l2)
-            if cur_dist < min_dist:
-                min_dist = cur_dist
+            cur_min_dist = l1.min_dist(l2)
+            cur_sum_dist = l1.min_sum_dist(l2)
+            min_dist_thres = threshold_func(l1, l2)
+            if cur_sum_dist < min_sum_dist and cur_min_dist < min_dist_thres:
+                min_sum_dist = cur_sum_dist
                 mi1, mi2 = i1, i2
         if mi1 < 0:
             break
@@ -192,7 +228,10 @@ def get_seglanes_by_filter(objects, lanetype, filter_func, dist_thres, dist_func
             indexes.remove(mi1)
             indexes.remove(mi2)
 
-    seglines += selected_lanes
+    for i in indexes:
+        seglines.append(selected_lanes[i])
+
+    #pprint(seglines)
 
     return seglines
 
@@ -360,7 +399,7 @@ class LabelViewer2(object):
         if self.out_dir is None:
             self.show()
         else:
-            self.write()
+            self.write(start_from)
 
     def show(self):
         # Read and draw image
@@ -374,7 +413,7 @@ class LabelViewer2(object):
         self.show_image()
         plt.show()
 
-    def write(self):
+    def write(self, start_from=0):
         dpi = 80
         w = 16
         h = 9
@@ -384,7 +423,7 @@ class LabelViewer2(object):
         out_paths = []
 
         self.start_index = 0
-        self.frame_index = 0
+        self.frame_index = start_from
         self.file_index = 0
         while self.file_index < len(self.label_paths):
             if self.label is None:
@@ -451,7 +490,6 @@ class LabelViewer2(object):
         frame = self.label[self.frame_index - self.start_index]
         self.current_frame = frame
 
-        print('Image: No.', self.frame_index, "\t", frame['name'])
         self.fig.canvas.set_window_title(frame['name'])
 
         if self.with_image:
@@ -500,6 +538,9 @@ class LabelViewer2(object):
         if self.poly2d:
             self.draw_other_poly2d(objects)
         self.ax.axis('off')
+
+        print('Image: No.', self.frame_index, "\t", frame['name'])
+
         return True
 
     def next_image(self, event):
@@ -594,7 +635,21 @@ class LabelViewer2(object):
             import pdb; pdb.set_trace()
             objects = get_seglanes(objects, self.draw_unrelevant)
         color = {
-                'stopline': (0.5, 0.5, 1.),
+                'stopline'            : (128./255., 128./255., 1.),
+                'crosswalk'           : (1., 1., 200./255.) ,
+                'road curb'           : (1., 1., 200./255.) ,
+                'double other solid'  : (1., 128./255., 160./255.) ,
+                'double other dashed' : (1., 128./255., 160./255.) ,
+                'double white solid'  : (1., 128./255., 130./255.) ,
+                'double white dashed' : (1., 128./255., 130./255.) ,
+                'double yellow solid' : (1., 128./255., 100./255.) ,
+                'double yellow dashed': (1., 128./255., 100./255.) ,
+                'single other solid'  : (1., 128./255., 250./255.) ,
+                'single other dashed' : (1., 128./255., 250./255.) ,
+                'single white solid'  : (1., 128./255., 230./255.) ,
+                'single white dashed' : (1., 128./255., 230./255.) ,
+                'single yellow solid' : (1., 128./255., 200./255.) ,
+                'single yellow dashed': (1., 128./255., 200./255.) ,
                 }
         for obj in objects:
             alpha = 1
